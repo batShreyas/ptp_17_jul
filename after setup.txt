@@ -1,0 +1,74 @@
+Step 1: Set Up the Network Environment
+Your KCU105 board is now a PTP slave device. It needs a PTP Master Clock on the same network to listen to. The easiest way to create one is by using a standard PC.
+
+Physical Connection:
+
+Connect the SFP port on your KCU105 board to a network switch.
+
+Connect a Linux PC (or a virtual machine) to the same network switch. They must be in the same subnet and VLAN.
+
+IP Addressing:
+
+Your KCU105 is configured with the static IP 192.168.1.10.
+
+Make sure the Linux PC has a static IP in the same range (e.g., 192.168.1.100 with a netmask of 255.255.255.0).
+
+Step 2: Run a PTP Master on a Linux PC
+You will use the standard linuxptp package to turn your PC into a PTP master clock.
+
+Install linuxptp: Open a terminal on the Linux PC and run:
+
+Bash
+
+sudo apt-get update
+sudo apt-get install linuxptp
+Find Network Interface Name: Find the name of the network interface connected to the switch (e.g., eth0, enp3s0).
+
+Bash
+
+ip addr
+Start the PTP Master: Run the following command, replacing <interface_name> with the name you found above. The -m flag tells it to run as a master.
+
+Bash
+
+sudo ptp4l -i <interface_name> -m
+You should see output indicating that it has entered the MASTER state. Your PC is now the grandmaster clock for the network.
+
+Step 3: Run and Monitor Your KCU105 Application
+Open a Serial Terminal:
+
+On your development machine, open a serial terminal program (like PuTTY, Tera Term, or the built-in terminal in Vitis/SDK).
+
+Connect to the COM port assigned to your KCU105's UART.
+
+Use the standard settings: 115200 baud, 8 data bits, 1 stop bit, no parity.
+
+Reset the KCU105 Board: Press the reset button on the board. The application will start, and you should see output in your serial terminal.
+
+Observe the PTP State Machine:
+
+You will first see the initialization messages we defined:
+
+----- PTP + lwIP UDP Server (Bare-Metal) -----
+PTPd: 64-bit hardware timer started.
+PTPd: Initializing ptpd options...
+PTPd: Starting PTP daemon
+Next, you will see the PTP state transitions:
+
+PTPd: State: PTP_INITIALIZING
+PTPd: State: PTP_LISTENING
+Success Condition: After a few seconds, the board should receive the "Announce" messages from your PC master and transition to the slave state. This is the key message to look for:
+
+PTPd: State: PTP_SLAVE
+Step 4: Verify Synchronization
+Once the board is in the PTP_SLAVE state, the servo.c logic will start running. It will calculate the time difference between the master (your PC) and the slave (your KCU105) and begin adjusting the hardware clock using the adjTime() function you created.
+
+Look for Servo Output: The reference lwip-ptpd code often prints the calculated offset from the master and the frequency adjustment. You should see these values start to converge towards zero.
+
+Stable State: If the board remains in the PTP_SLAVE state and the clock offset stabilizes to a very small number (typically sub-microsecond), then your PTP implementation is working correctly.
+
+Troubleshooting:
+
+If it stays in PTP_LISTENING: It's not receiving PTP messages. Check your physical connections, ensure the PC and KCU105 are on the same switch/VLAN, and check for firewalls on the Linux PC.
+
+If it becomes PTP_MASTER: It timed out waiting for a master and promoted itself. This also means it cannot see the master on the PC.
