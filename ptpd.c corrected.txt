@@ -1,0 +1,193 @@
+/**
+ * @file ptpd.c
+ * @mainpage PTPd v2.0
+ * @version 2.0
+ * @authors
+ * - Original work by Wojciech Owczarek
+ * - Bare-metal and lwIP integration by Xilinx/contributors
+ *
+ * This file contains the main PTP protocol logic. It is designed to be
+ * called periodically from a bare-metal main loop.
+ */
+
+#include "ptpd.h"
+
+// --- Global PTP Data Structures ---
+// These are defined and initialized in main.c and are used by the PTP engine.
+extern ptp_clock_t ptp_clock;
+extern ptpd_opts ptp_opts;
+extern foreign_master_record_t foreign_records[];
+
+
+// --- Forward Declarations for Static Functions ---
+// This tells the compiler that these functions exist before they are used.
+static void do_state(ptp_clock_t *clock, ptpd_opts *opts);
+static void do_state_initializing(ptp_clock_t *clock, ptpd_opts *opts);
+static void do_state_listening(ptp_clock_t *clock, ptpd_opts *opts);
+static void do_state_master(ptp_clock_t *clock, ptpd_opts *opts);
+static void do_state_slave(ptp_clock_t *clock, ptpd_opts *opts);
+static void do_state_other(ptp_clock_t *clock, ptpd_opts *opts);
+static void to_state(ptp_port_state_t state, ptp_clock_t *clock, ptpd_opts *opts);
+
+
+/**
+ * @brief Main entry point for PTP daemon initialization.
+ *
+ * This function initializes the PTP clock data structures and prepares the
+ * protocol stack for operation. It should be called once at startup.
+ *
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ * @param records A pointer to the foreign master record array.
+ * @return 0 on success, a non-zero value on failure.
+ */
+int ptp_startup(ptp_clock_t *clock, ptpd_opts *opts, foreign_master_record_t *records)
+{
+    xil_printf("PTPd: Starting PTP daemon\r\n");
+
+    // Initialize the main PTP clock data structure
+    memset(clock, 0, sizeof(ptp_clock_t));
+    clock->foreign = records;
+
+    // Initialize protocol state machines
+    init_data(clock, opts);
+    init_timer_lists(clock);
+
+    // Perform initial PTP state transitions
+    to_state(PTP_INITIALIZING, clock, opts);
+
+    return 0;
+}
+
+/**
+ * @brief Periodic handler for the PTP protocol stack.
+ *
+ * This function must be called periodically by the application (e.g., every
+ * 100ms from a timer interrupt) to run the PTP state machines. It handles
+ * timer expiries, state transitions, and message processing.
+ */
+void ptpd_periodic_handler(void)
+{
+    // Check for expired PTP timers
+    timer_tick(&ptp_clock);
+
+    // Handle the current PTP state
+    do_state(&ptp_clock, &ptp_opts);
+}
+
+
+// =================================================================
+// The following are the core PTP protocol state machine functions.
+// These are called internally by ptpd_periodic_handler().
+// =================================================================
+
+/**
+ * @brief Main state machine dispatcher.
+ *
+ * This function calls the appropriate do_state_* function based on the
+ * current PTP port state.
+ *
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ */
+static void do_state(ptp_clock_t *clock, ptpd_opts *opts)
+{
+    switch (clock->port_state) {
+    case PTP_INITIALIZING:
+        do_state_initializing(clock, opts);
+        break;
+    case PTP_LISTENING:
+        do_state_listening(clock, opts);
+        break;
+    case PTP_MASTER:
+        do_state_master(clock, opts);
+        break;
+    case PTP_SLAVE:
+        do_state_slave(clock, opts);
+        break;
+    case PTP_DISABLED:
+    case PTP_FAULTY:
+    default:
+        do_state_other(clock, opts);
+        break;
+    }
+}
+
+
+/**
+ * @brief Handle actions and state transitions for the PTP_INITIALIZING state.
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ */
+static void do_state_initializing(ptp_clock_t *clock, ptpd_opts *opts)
+{
+    xil_printf("PTPd: State: PTP_INITIALIZING\r\n");
+
+    // Transition to the appropriate next state based on configuration
+    if (opts->slave_only) {
+        to_state(PTP_LISTENING, clock, opts);
+    } else {
+        to_state(PTP_LISTENING, clock, opts);
+    }
+}
+
+/**
+ * @brief Handle actions and state transitions for the PTP_LISTENING state.
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ */
+static void do_state_listening(ptp_clock_t *clock, ptpd_opts *opts)
+{
+    // In listening state, we just wait for announce messages or for the
+    // announce timeout to expire to potentially become master.
+    // The actual logic is handled by the timer expiries and message handlers.
+    // This function can be expanded for more detailed logging if needed.
+}
+
+/**
+ * @brief Handle actions and state transitions for the PTP_MASTER state.
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ */
+static void do_state_master(ptp_clock_t *clock, ptpd_opts *opts)
+{
+    // When in master state, we are responsible for sending Announce,
+    // Sync, and Follow_Up messages. This is handled by the timer expiry functions.
+    // (e.g., handle_announce_timeout, handle_sync_timeout)
+}
+
+/**
+ * @brief Handle actions and state transitions for the PTP_SLAVE state.
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ */
+static void do_state_slave(ptp_clock_t *clock, ptpd_opts *opts)
+{
+    // In slave state, we synchronize to the master clock.
+    // The clock servo logic is updated when Delay_Resp messages are received.
+    update_clock(clock, opts);
+}
+
+/**
+ * @brief Handle actions for other PTP states (e.g., PTP_DISABLED, PTP_FAULTY).
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ */
+static void do_state_other(ptp_clock_t *clock, ptpd_opts *opts)
+{
+    // Handle disabled, faulty, or other states as necessary.
+    // For now, this is a placeholder.
+}
+
+/**
+ * @brief Transition the PTP port to a new state.
+ * @param state The new state to transition to.
+ * @param clock A pointer to the ptp_clock_t structure.
+ * @param opts A pointer to the ptpd_opts runtime options.
+ */
+static void to_state(ptp_port_state_t state, ptp_clock_t *clock, ptpd_opts *opts)
+{
+    clock->port_state = state;
+    // Additional actions on state transition can be added here
+    // For example, resetting timers or clearing data.
+}

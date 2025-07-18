@@ -1,0 +1,189 @@
+#ifndef PTPD_H_
+#define PTPD_H_
+
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+
+// Include lwIP headers for networking types
+#include "lwip/ip_addr.h"
+#include "lwip/udp.h"
+#include "lwip/sys.h" // For sys_mbox_t
+
+// Include Xilinx specific types
+#include "xil_printf.h"
+#include "xil_types.h"
+
+// --- PTP Protocol Constants (from IEEE 1588-2008) ---
+#define PTP_EVENT_PORT      319
+#define PTP_GENERAL_PORT    320
+
+// Multicast Addresses
+#define PTP_PRIMARY_MULTICAST_IP    IPADDR4_INIT_BYTES(224, 0, 1, 129)
+#define PTP_PEER_MULTICAST_IP       IPADDR4_INIT_BYTES(224, 0, 0, 107)
+
+#define PTPD_DEFAULT_MAX_FOREIGN_RECORDS 5
+
+// PTP Port States
+typedef enum {
+    PTP_INITIALIZING,
+    PTP_FAULTY,
+    PTP_DISABLED,
+    PTP_LISTENING,
+    PTP_PRE_MASTER,
+    PTP_MASTER,
+    PTP_PASSIVE,
+    PTP_UNCALIBRATED,
+    PTP_SLAVE
+} ptp_port_state_t;
+
+// PTP Message Types
+typedef enum {
+    SYNC_MSG,
+    DELAY_REQ_MSG,
+    PDELAY_REQ_MSG,
+    PDELAY_RESP_MSG,
+    FOLLOW_UP_MSG,
+    DELAY_RESP_MSG,
+    PDELAY_RESP_FOLLOW_UP_MSG,
+    ANNOUNCE_MSG,
+    SIGNALING_MSG,
+    MANAGEMENT_MSG,
+} ptp_message_type_t;
+
+// --- Core PTP Data Structures ---
+
+// Time representation (seconds and nanoseconds)
+typedef struct {
+    int64_t seconds;
+    int32_t nanoseconds;
+} TimeInternal;
+
+// Uniquely identifies a PTP port
+typedef struct {
+    uint8_t clockIdentity[8];
+    uint16_t portNumber;
+} PortIdentity;
+
+// Represents the quality of a clock
+typedef struct {
+    uint8_t clock_class;
+    uint8_t clock_accuracy;
+    uint16_t offset_scaled_log_variance;
+} ClockQuality;
+
+// Holds network-related info (PCBs)
+typedef struct {
+    struct udp_pcb *event_pcb;
+    struct udp_pcb *general_pcb;
+} net_path_t;
+
+// Stores information about potential masters
+typedef struct {
+    PortIdentity port_identity;
+    // Add other fields as needed for BMC algorithm
+} foreign_master_record_t;
+
+// Runtime configuration options
+typedef struct {
+    bool slave_only;
+    int8_t sync_interval;
+    uint8_t announce_interval;
+    ClockQuality clock_quality;
+    uint8_t priority1;
+    uint8_t priority2;
+    // Add other options as needed
+} ptpd_opts;
+
+
+// The main PTP clock data structure
+typedef struct {
+    // Current time, updated by the clock servo
+    TimeInternal time;
+
+    // PTP port state
+    ptp_port_state_t port_state;
+
+    // Port identity information
+    PortIdentity port_identity;
+
+    // Network path information
+    net_path_t net_path;
+
+    // Foreign master records for BMC algorithm
+    foreign_master_record_t *foreign;
+
+    // Pointers to various data sets used by the protocol
+    // (e.g., defaultDS, currentDS, parentDS, timePropertiesDS)
+    void *default_ds;
+    void *current_ds;
+    void *parent_ds;
+    void *time_properties_ds;
+
+    // Software timers for PTP events
+    int32_t sync_interval_timer;
+    int32_t announce_interval_timer;
+    // Add other timers as needed
+
+} ptp_clock_t;
+
+
+// --- PTP Message Header Structures ---
+
+// Common header for all PTP messages
+typedef struct {
+    uint8_t messageType;
+    uint8_t versionPTP;
+    uint16_t messageLength;
+    uint8_t domainNumber;
+    uint8_t reserved1;
+    uint16_t flags;
+    int64_t correctionField;
+    uint32_t reserved2;
+    PortIdentity sourcePortIdentity;
+    uint16_t sequenceId;
+    uint8_t controlField;
+    int8_t logMessageInterval;
+} PtpHeader;
+
+// Announce Message
+typedef struct {
+    TimeInternal originTimestamp;
+    int16_t currentUtcOffset;
+    uint8_t reserved;
+    uint8_t grandmasterPriority1;
+    ClockQuality grandmasterClockQuality;
+    uint8_t grandmasterPriority2;
+    uint8_t grandmasterIdentity[8];
+    uint16_t stepsRemoved;
+    uint8_t timeSource;
+} AnnounceMessage;
+
+
+// --- Function Prototypes (Public API) ---
+
+// From ptpd.c (Core Protocol Engine)
+int ptp_startup(ptp_clock_t *clock, ptpd_opts *opts, foreign_master_record_t *records);
+void ptpd_periodic_handler(void);
+
+// From net.c (Network Layer)
+bool ptpd_net_init(net_path_t *net_path);
+void ptpd_net_shutdown(net_path_t *net_path);
+int net_send_event(const void *data, int len);
+int net_send_general(const void *data, int len);
+
+// From sys_arch_ptp.c (Hardware Abstraction Layer)
+void ptpd_hw_timer_init(void);
+void getTime(TimeInternal *time);
+void setTime(const TimeInternal *time);
+bool adjTime(int32_t adj_ns);
+
+// From other dependency files (msg.c, clock.c, servo.c, etc.)
+void init_data(ptp_clock_t *clock, ptpd_opts *opts);
+void init_timer_lists(ptp_clock_t *clock);
+void timer_tick(ptp_clock_t *clock);
+void handle_msg(void *data, int len);
+void update_clock(ptp_clock_t *clock, ptpd_opts *opts);
+// Add other prototypes from bmc.c, servo.c, etc. as you implement them
+
+#endif /* PTPD_H_ */
