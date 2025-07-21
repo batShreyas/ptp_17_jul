@@ -1,0 +1,343 @@
+/**
+ * @file msg.c
+ * @brief PTP message packing and unpacking functions.
+ *
+ * This file is responsible for serializing PTP data structures into byte
+ * arrays for network transmission and deserializing received byte arrays
+ * back into their corresponding C structures.
+ */
+
+#include "../ptpd.h"
+
+// --- Endianness Conversion Utilities ---
+// PTP is a big-endian (network byte order) protocol. These functions ensure
+// that data is correctly formatted regardless of the host processor's endianness.
+
+static uint16_t swap16(uint16_t val) {
+    return (((val >> 8)) | ((val & 0xff) << 8));
+}
+
+static uint32_t swap32(uint32_t val) {
+    return ((val >> 24) |
+           ((val << 8) & 0x00ff0000) |
+           ((val >> 8) & 0x0000ff00) |
+           (val << 24));
+}
+
+static int64_t swap64(int64_t val) {
+    return ((val >> 56) |
+           ((val & 0x00ff000000000000) >> 40) |
+           ((val & 0x0000ff0000000000) >> 24) |
+           ((val & 0x000000ff00000000) >> 8)  |
+           ((val & 0x00000000ff000000) << 8)  |
+           ((val & 0x0000000000ff0000) << 24) |
+           ((val & 0x000000000000ff00) << 40) |
+           (val << 56));
+}
+
+// On a big-endian machine like MicroBlaze, these are no-ops.
+// On a little-endian machine, they perform the swap.
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define htons(x) swap16(x)
+#define ntohs(x) swap16(x)
+#define htonl(x) swap32(x)
+#define ntohl(x) swap32(x)
+#define htonll(x) swap64(x)
+#define ntohll(x) swap64(x)
+#else
+#define htons(x) (x)
+#define ntohs(x) (x)
+#define htonl(x) (x)
+#define ntohl(x) (x)
+#define htonll(x) (x)
+#define ntohll(x) (x)
+#endif
+
+// --- Timestamp Packing/Unpacking Helpers ---
+
+static void unpack_timestamp(const uint8_t *buf, TimeInternal *timestamp)
+{
+    int16_t seconds_msb;
+    uint32_t seconds_lsb;
+    memcpy(&seconds_msb, buf, 2);
+    memcpy(&seconds_lsb, buf + 2, 4);
+    memcpy(&timestamp->nanoseconds, buf + 6, 4);
+
+    timestamp->seconds = (int64_t)ntohs(seconds_msb) << 32 | ntohl(seconds_lsb);
+    timestamp->nanoseconds = ntohl(timestamp->nanoseconds);
+}
+
+static void pack_timestamp(uint8_t *buf, const TimeInternal *timestamp)
+{
+    int16_t seconds_msb = htons((int16_t)(timestamp->seconds >> 32));
+    uint32_t seconds_lsb = htonl((uint32_t)timestamp->seconds);
+    uint32_t nanoseconds_n = htonl(timestamp->nanoseconds);
+
+    memcpy(buf, &seconds_msb, 2);
+    memcpy(buf + 2, &seconds_lsb, 4);
+    memcpy(buf + 6, &nanoseconds_n, 4);
+}
+
+
+// --- Unpacking Functions (Network Buffer -> Struct) ---
+
+/**
+ * @brief Unpack the common PTP message header.
+ * @param buf The raw network buffer.
+ * @param header A pointer to the PtpHeader struct to populate.
+ */
+static void msg_unpack_header(const uint8_t *buf, PtpHeader *header)
+{
+    header->messageType = buf[0] & 0x0F;
+    header->versionPTP = buf[1] & 0x0F;
+    memcpy(&header->messageLength, buf + 2, 2);
+    header->messageLength = ntohs(header->messageLength);
+    header->domainNumber = buf[4];
+    memcpy(&header->flags, buf + 6, 2);
+    header->flags = ntohs(header->flags);
+    memcpy(&header->correctionField, buf + 8, 8);
+    header->correctionField = ntohll(header->correctionField);
+    memcpy(header->sourcePortIdentity.clockIdentity, buf + 20, 8);
+    memcpy(&header->sourcePortIdentity.portNumber, buf + 28, 2);
+    header->sourcePortIdentity.portNumber = ntohs(header->sourcePortIdentity.portNumber);
+    memcpy(&header->sequenceId, buf + 30, 2);
+    header->sequenceId = ntohs(header->sequenceId);
+    header->controlField = buf[32];
+    header->logMessageInterval = buf[33];
+}
+
+/**
+ * @brief Unpack the body of an Announce message.
+ * @param buf The raw network buffer.
+ * @param announce A pointer to the AnnounceMessage struct to populate.
+ */
+static void msg_unpack_announce(const uint8_t *buf, AnnounceMessage *announce)
+{
+    // originTimestamp is at offset 34 (10 bytes)
+    memcpy(&announce->currentUtcOffset, buf + 44, 2);
+    announce->currentUtcOffset = ntohs(announce->currentUtcOffset);
+    announce->grandmasterPriority1 = buf[47];
+    announce->grandmasterClockQuality.clock_class = buf[48];
+    announce->grandmasterClockQuality.clock_accuracy = buf[49];
+    memcpy(&announce->grandmasterClockQuality.offset_scaled_log_variance, buf + 50, 2);
+    announce->grandmasterClockQuality.offset_scaled_log_variance = ntohs(announce->grandmasterClockQuality.offset_scaled_log_variance);
+    announce->grandmasterPriority2 = buf[52];
+    memcpy(announce->grandmasterIdentity, buf + 53, 8);
+    memcpy(&announce->stepsRemoved, buf + 61, 2);
+    announce->stepsRemoved = ntohs(announce->stepsRemoved);
+    announce->timeSource = buf[63];
+}
+
+
+// --- Main Message Handling Dispatcher ---
+
+// Forward declarations for message handlers (these will live in other files)
+extern void handle_announce(const PtpHeader *header, const AnnounceMessage *announce);
+extern void handle_sync(const PtpHeader *header, const TimeInternal *originTimestamp);
+extern void handle_follow_up(const PtpHeader *header, const TimeInternal *preciseOriginTimestamp);
+extern void handle_delay_resp(const PtpHeader *header, const TimeInternal *receiveTimestamp, const PortIdentity *requestingPortIdentity);
+
+/**
+ * @brief The main entry point for processing any received PTP message.
+ */
+void handle_msg(void *data, int len)
+{
+    PtpHeader header;
+    uint8_t *buf = (uint8_t *)data;
+
+    if (len < 34) return;
+    msg_unpack_header(buf, &header);
+
+    switch (header.messageType) {
+        case ANNOUNCE_MSG:
+            if (len >= 64) {
+                AnnounceMessage announce;
+                msg_unpack_announce(buf, &announce);
+                handle_announce(&header, &announce);
+            }
+            break;
+        case SYNC_MSG:
+            if (len >= 44) {
+                TimeInternal originTimestamp;
+                unpack_timestamp(buf + 34, &originTimestamp);
+                handle_sync(&header, &originTimestamp);
+            }
+            break;
+        case FOLLOW_UP_MSG:
+             if (len >= 44) {
+                TimeInternal preciseOriginTimestamp;
+                unpack_timestamp(buf + 34, &preciseOriginTimestamp);
+                handle_follow_up(&header, &preciseOriginTimestamp);
+            }
+            break;
+        case DELAY_RESP_MSG:
+            if (len >= 54) {
+                TimeInternal receiveTimestamp;
+                PortIdentity requestingPortIdentity;
+                unpack_timestamp(buf + 34, &receiveTimestamp);
+                memcpy(requestingPortIdentity.clockIdentity, buf + 44, 8);
+                memcpy(&requestingPortIdentity.portNumber, buf + 52, 2);
+                requestingPortIdentity.portNumber = ntohs(requestingPortIdentity.portNumber);
+                handle_delay_resp(&header, &receiveTimestamp, &requestingPortIdentity);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+
+// --- Packing Functions (Struct -> Network Buffer) ---
+
+/**
+ * @brief Pack the common PTP message header into a buffer.
+ */
+static void msg_pack_header(uint8_t *buf, const PtpHeader *header)
+{
+    buf[0] = (header->messageType & 0x0F);
+    buf[1] = (header->versionPTP & 0x0F);
+    uint16_t messageLength_n = htons(header->messageLength);
+    memcpy(buf + 2, &messageLength_n, 2);
+    buf[4] = header->domainNumber;
+    uint16_t flags_n = htons(header->flags);
+    memcpy(buf + 6, &flags_n, 2);
+    int64_t correctionField_n = htonll(header->correctionField);
+    memcpy(buf + 8, &correctionField_n, 8);
+    memcpy(buf + 20, header->sourcePortIdentity.clockIdentity, 8);
+    uint16_t portNumber_n = htons(header->sourcePortIdentity.portNumber);
+    memcpy(buf + 28, &portNumber_n, 2);
+    uint16_t sequenceId_n = htons(header->sequenceId);
+    memcpy(buf + 30, &sequenceId_n, 2);
+    buf[32] = header->controlField;
+    buf[33] = header->logMessageInterval;
+}
+
+/**
+ * @brief Pack an Announce message into a buffer.
+ */
+void msg_pack_announce(uint8_t *buf, ptp_clock_t *clock)
+{
+    PtpHeader header;
+    // Populate Header
+    header.messageType = ANNOUNCE_MSG;
+    header.versionPTP = 2;
+    header.messageLength = 64;
+    header.domainNumber = clock->default_ds.domain_number;
+    header.flags = clock->default_ds.two_step_flag ? 0x0200 : 0;
+    header.correctionField = 0;
+    header.sourcePortIdentity = clock->port_ds.port_identity;
+    // header.sequenceId = clock->sent_announce_sequence_id++;
+    header.controlField = 5; // "Other"
+    header.logMessageInterval = clock->port_ds.log_announce_interval;
+    msg_pack_header(buf, &header);
+
+    // Pack Announce Body
+    memset(buf + 34, 0, 10); // originTimestamp is zero
+    uint16_t utc_offset_n = htons(clock->time_properties_ds.current_utc_offset);
+    memcpy(buf + 44, &utc_offset_n, 2);
+    buf[47] = clock->parent_ds.grandmaster_priority1;
+    buf[48] = clock->parent_ds.grandmaster_clock_quality.clock_class;
+    buf[49] = clock->parent_ds.grandmaster_clock_quality.clock_accuracy;
+    uint16_t variance_n = htons(clock->parent_ds.grandmaster_clock_quality.offset_scaled_log_variance);
+    memcpy(buf + 50, &variance_n, 2);
+    buf[52] = clock->parent_ds.grandmaster_priority2;
+    memcpy(buf + 53, clock->parent_ds.grandmaster_identity, 8);
+    // uint16_t steps_n = htons(clock->current_ds.steps_removed);
+    // memcpy(buf + 61, &steps_n, 2);
+    buf[63] = clock->time_properties_ds.time_source;
+}
+
+/**
+ * @brief Pack a Sync message into a buffer.
+ */
+void msg_pack_sync(uint8_t *buf, ptp_clock_t *clock, const TimeInternal *originTimestamp)
+{
+    PtpHeader header;
+    // Populate Header
+    header.messageType = SYNC_MSG;
+    header.versionPTP = 2;
+    header.messageLength = 44;
+    header.domainNumber = clock->default_ds.domain_number;
+    header.flags = clock->default_ds.two_step_flag ? 0x0200 : 0;
+    header.correctionField = 0;
+    header.sourcePortIdentity = clock->port_ds.port_identity;
+    // header.sequenceId = clock->sent_sync_sequence_id;
+    header.controlField = 0; // "Sync"
+    header.logMessageInterval = clock->port_ds.log_sync_interval;
+    msg_pack_header(buf, &header);
+
+    // Pack Sync Body (just the timestamp)
+    pack_timestamp(buf + 34, originTimestamp);
+}
+
+/**
+ * @brief Pack a Follow_Up message into a buffer.
+ */
+void msg_pack_follow_up(uint8_t *buf, ptp_clock_t *clock, const TimeInternal *preciseOriginTimestamp)
+{
+    PtpHeader header;
+    // Populate Header
+    header.messageType = FOLLOW_UP_MSG;
+    header.versionPTP = 2;
+    header.messageLength = 44;
+    header.domainNumber = clock->default_ds.domain_number;
+    header.flags = 0;
+    header.correctionField = 0;
+    header.sourcePortIdentity = clock->port_ds.port_identity;
+    // header.sequenceId = clock->sent_sync_sequence_id - 1;
+    header.controlField = 2; // "Follow_Up"
+    header.logMessageInterval = clock->port_ds.log_sync_interval;
+    msg_pack_header(buf, &header);
+
+    // Pack Follow_Up Body (just the timestamp)
+    pack_timestamp(buf + 34, preciseOriginTimestamp);
+}
+
+/**
+ * @brief Pack a Delay_Req message into a buffer.
+ */
+void msg_pack_delay_req(uint8_t *buf, ptp_clock_t *clock, const TimeInternal *originTimestamp)
+{
+    PtpHeader header;
+    // Populate Header
+    header.messageType = DELAY_REQ_MSG;
+    header.versionPTP = 2;
+    header.messageLength = 44;
+    header.domainNumber = clock->default_ds.domain_number;
+    header.flags = 0;
+    header.correctionField = 0;
+    header.sourcePortIdentity = clock->port_ds.port_identity;
+    // header.sequenceId = clock->sent_delay_req_sequence_id++;
+    header.controlField = 1; // "Delay_Req"
+    header.logMessageInterval = 0x7F; // Unused
+    msg_pack_header(buf, &header);
+
+    // Pack Delay_Req Body (just the timestamp)
+    pack_timestamp(buf + 34, originTimestamp);
+}
+
+/**
+ * @brief Pack a Delay_Resp message into a buffer.
+ */
+void msg_pack_delay_resp(uint8_t *buf, ptp_clock_t *clock, const PtpHeader *req_header, const TimeInternal *receiveTimestamp)
+{
+    PtpHeader header;
+    // Populate Header
+    header.messageType = DELAY_RESP_MSG;
+    header.versionPTP = 2;
+    header.messageLength = 54;
+    header.domainNumber = req_header->domainNumber;
+    header.flags = 0;
+    header.correctionField = req_header->correctionField; // Copy from request
+    header.sourcePortIdentity = clock->port_ds.port_identity;
+    header.sequenceId = req_header->sequenceId; // Copy from request
+    header.controlField = 3; // "Delay_Resp"
+    // header.logMessageInterval = clock->port_ds.log_min_delay_req_interval;
+    msg_pack_header(buf, &header);
+
+    // Pack Delay_Resp Body
+    pack_timestamp(buf + 34, receiveTimestamp);
+    memcpy(buf + 44, req_header->sourcePortIdentity.clockIdentity, 8);
+    uint16_t portNumber_n = htons(req_header->sourcePortIdentity.portNumber);
+    memcpy(buf + 52, &portNumber_n, 2);
+}

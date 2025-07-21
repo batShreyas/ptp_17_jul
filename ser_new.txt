@@ -1,0 +1,189 @@
+#include "../ptpd.h"
+#include <stdlib.h> // For abs()
+
+// --- Time Arithmetic Helper Functions ---
+
+static void sub_time(TimeInternal *r, const TimeInternal *a, const TimeInternal *b)
+{
+    r->seconds = a->seconds - b->seconds;
+    r->nanoseconds = a->nanoseconds - b->nanoseconds;
+
+    if (r->nanoseconds < 0) {
+        r->seconds--;
+        r->nanoseconds += 1000000000;
+    }
+}
+
+static void add_time(TimeInternal *r, const TimeInternal *a, const TimeInternal *b)
+{
+    r->seconds = a->seconds + b->seconds;
+    r->nanoseconds = a->nanoseconds + b->nanoseconds;
+
+    if (r->nanoseconds >= 1000000000) {
+        r->seconds++;
+        r->nanoseconds -= 1000000000;
+    }
+}
+
+static void halve_time(TimeInternal *r)
+{
+    r->nanoseconds += r->seconds % 2 * 1000000000;
+    r->seconds /= 2;
+    r->nanoseconds /= 2;
+}
+
+static int32_t floor_log2(uint32_t n)
+{
+    int count = 0;
+    while (n > 1) {
+        n >>= 1;
+        count++;
+    }
+    return count;
+}
+
+
+// --- PI Filter Functions ---
+
+static void filter(int32_t *nsec_current, Filter_t *filt)
+{
+    int32_t s;
+    if (filt->n == 0) {
+        filt->y = *nsec_current;
+    }
+    filt->n++;
+
+    s = filt->s;
+    if ((1 << s) > filt->n) {
+        s = floor_log2(filt->n);
+    }
+
+    filt->y = (filt->y * ((1 << s) - 1) + *nsec_current) >> s;
+    *nsec_current = filt->y;
+}
+
+
+// --- Main Servo Functions ---
+
+/**
+ * @brief Initialize the clock servo and its filters.
+ * @param clock A pointer to the PTP clock data structure.
+ */
+void servo_init_clock(ptp_clock_t *clock)
+{
+    xil_printf("PTPd: Initializing clock servo\r\n");
+
+    // Clear filters
+    clock->ofm_filt.n = 0;
+    clock->ofm_filt.s = 4; // A reasonable starting filter strength for offset
+    clock->owd_filt.n = 0;
+    clock->owd_filt.s = 4; // A reasonable starting filter strength for delay
+
+    // Reset drift calculation
+    clock->observed_drift = 0;
+
+    // Reset hardware frequency adjustment
+    adjTime(0);
+}
+
+/**
+ * @brief Update the offset from master based on a Sync/Follow-Up pair.
+ * @param clock A pointer to the PTP clock data structure.
+ * @param sync_event_ingress_timestamp The time the Sync message arrived.
+ * @param precise_origin_timestamp The precise time the Sync message was sent.
+ */
+void servo_update_offset(ptp_clock_t *clock, const TimeInternal *sync_event_ingress_timestamp, const TimeInternal *precise_origin_timestamp)
+{
+    TimeInternal offset;
+
+    // offset = (T2 - T1) - meanPathDelay
+    // T2 = sync_event_ingress_timestamp
+    // T1 = precise_origin_timestamp
+    sub_time(&offset, sync_event_ingress_timestamp, precise_origin_timestamp);
+    sub_time(&offset, &offset, &clock->mean_path_delay);
+
+    clock->offset_from_master = offset;
+
+    // Filter the offset to smooth out network jitter
+    if (clock->offset_from_master.seconds == 0) {
+        filter(&clock->offset_from_master.nanoseconds, &clock->ofm_filt);
+    } else {
+        // A large offset likely means a clock jump, reset the filter
+        clock->ofm_filt.n = 0;
+    }
+}
+
+/**
+ * @brief Update the mean path delay based on a Delay_Req/Delay_Resp pair.
+ * @param clock A pointer to the PTP clock data structure.
+ * @param delay_event_egress_timestamp The time the Delay_Req was sent.
+ * @param recv_timestamp The time the Delay_Resp arrived.
+ */
+void servo_update_delay(ptp_clock_t *clock, const TimeInternal *delay_event_egress_timestamp, const TimeInternal *recv_timestamp)
+{
+    TimeInternal Tsm; // Time from slave to master (T4 - T3)
+    TimeInternal Tms; // Time from master to slave (T2 - T1)
+
+    // Tms is the offset we calculated in servo_update_offset before subtracting delay
+    sub_time(&Tms, sync_event_ingress_timestamp, precise_origin_timestamp);
+
+    // Tsm = T4 - T3
+    sub_time(&Tsm, recv_timestamp, delay_event_egress_timestamp);
+
+    // meanPathDelay = (Tms + Tsm) / 2
+    add_time(&clock->mean_path_delay, &Tms, &Tsm);
+    halve_time(&clock->mean_path_delay);
+
+    // Filter the delay to smooth out network jitter
+    if (clock->mean_path_delay.seconds == 0) {
+        filter(&clock->mean_path_delay.nanoseconds, &clock->owd_filt);
+    } else {
+        // A large delay value is unusual, reset the filter
+        clock->owd_filt.n = 0;
+    }
+}
+
+
+/**
+ * @brief The main servo function that adjusts the local clock.
+ *
+ * This is the PI controller. It uses the filtered offset from master and
+ * the accumulated drift to calculate a frequency adjustment for the clock.
+ *
+ * @param clock A pointer to the PTP clock data structure.
+ */
+void servo_update_clock(ptp_clock_t *clock)
+{
+    int32_t adj;
+    int32_t offset_ns = clock->offset_from_master.nanoseconds;
+
+    // Check for a large offset that requires a hard clock step
+    if (abs(offset_ns) > 10000000 && clock->offset_from_master.seconds == 0) {
+        TimeInternal now;
+        getTime(&now);
+        sub_time(&now, &now, &clock->offset_from_master);
+        setTime(&now);
+        servo_init_clock(clock); // Reset servo after a jump
+        return;
+    }
+
+    // --- PI Controller Logic ---
+    // The integral component (accumulated drift)
+    clock->observed_drift += (offset_ns / 8); // I-gain is 1/8
+
+    // Clamp the drift to a max value to prevent wind-up
+    if (clock->observed_drift > ADJ_FREQ_MAX) clock->observed_drift = ADJ_FREQ_MAX;
+    if (clock->observed_drift < -ADJ_FREQ_MAX) clock->observed_drift = -ADJ_FREQ_MAX;
+
+    // The proportional component
+    adj = (offset_ns / 2) + clock->observed_drift; // P-gain is 1/2
+
+    // Apply the adjustment to the hardware clock via the HAL
+    adjTime(-adj); // adjTime expects ppb, but we pass scaled ns for simplicity
+
+    xil_printf("PTPd: offset: %d ns, delay: %d ns, drift: %d, adj: %d\r\n",
+        clock->offset_from_master.nanoseconds,
+        clock->mean_path_delay.nanoseconds,
+        clock->observed_drift,
+        -adj);
+}

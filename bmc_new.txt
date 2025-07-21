@@ -1,0 +1,291 @@
+#include "../ptpd.h"
+
+// --- Forward Declarations for Static Functions ---
+static int8_t compare_datasets(const PtpHeader *hA, const AnnounceMessage *aA, const PtpHeader *hB, const AnnounceMessage *aB, ptp_clock_t *clock);
+static void update_parent_data_set(ptp_clock_t *clock, const PtpHeader *header, const AnnounceMessage *announce);
+static void update_local_as_master(ptp_clock_t *clock);
+static uint8_t state_decision(const PtpHeader *best_header, const AnnounceMessage *best_announce, ptp_clock_t *clock);
+static bool is_same_port_identity(const PortIdentity *a, const PortIdentity *b);
+
+
+/**
+ * @brief Convert a 48-bit MAC address (EUI-48) to a 64-bit PTP Clock Identity (EUI-64).
+ * @param eui48 Pointer to the 6-byte source MAC address.
+ * @param eui64 Pointer to the 8-byte destination Clock Identity.
+ */
+static void eui48_to_eui64(const uint8_t *eui48, uint8_t *eui64)
+{
+    eui64[0] = eui48[0];
+    eui64[1] = eui48[1];
+    eui64[2] = eui48[2];
+    eui64[3] = 0xff;
+    eui64[4] = 0xfe;
+    eui64[5] = eui48[3];
+    eui64[6] = eui48[4];
+    eui64[7] = eui48[5];
+}
+
+/**
+ * @brief Initialize the PTP clock's internal datasets.
+ * This should be called once at startup.
+ * @param clock A pointer to the PTP clock data structure.
+ * @param opts A pointer to the runtime options.
+ */
+void init_data(ptp_clock_t *clock, ptpd_opts *opts)
+{
+    xil_printf("PTPd: Initializing data sets...\r\n");
+
+    // This is the MAC address from your main.c. In a real application,
+    // this might be passed in or read from hardware.
+    uint8_t mac_addr[] = { 0x00, 0x0a, 0x35, 0x00, 0x01, 0x02 };
+
+    // --- Default Data Set (Table 8 of IEEE 1588-2008) ---
+    clock->default_ds.two_step_flag = TRUE;
+    eui48_to_eui64(mac_addr, clock->default_ds.clock_identity);
+    clock->default_ds.number_ports = 1;
+    clock->default_ds.clock_quality = opts->clock_quality;
+    clock->default_ds.priority1 = opts->priority1;
+    clock->default_ds.priority2 = opts->priority2;
+    clock->default_ds.domain_number = 0; // Assuming domain 0
+    clock->default_ds.slave_only = opts->slave_only;
+
+    // --- Port Data Set ---
+    memcpy(clock->port_ds.port_identity.clockIdentity, clock->default_ds.clock_identity, 8);
+    clock->port_ds.port_identity.portNumber = 1;
+    clock->port_ds.log_announce_interval = opts->announce_interval;
+    clock->port_ds.log_sync_interval = opts->sync_interval;
+    clock->port_ds.announce_receipt_timeout = 3; // Default value
+
+    // --- Parent Data Set ---
+    // Will be populated by BMC when we become a slave
+
+    // --- Time Properties Data Set ---
+    clock->time_properties_ds.current_utc_offset = 0; // Example value
+    clock->time_properties_ds.current_utc_offset_valid = FALSE;
+    clock->time_properties_ds.leap59 = FALSE;
+    clock->time_properties_ds.leap61 = FALSE;
+    clock->time_properties_ds.time_traceable = FALSE;
+    clock->time_properties_ds.frequency_traceable = FALSE;
+    clock->time_properties_ds.ptp_timescale = TRUE;
+    clock->time_properties_ds.time_source = 0xA0; // Internal Oscillator
+}
+
+
+/**
+ * @brief Helper function to compare two PortIdentity structures.
+ * @return TRUE if the identities are the same, FALSE otherwise.
+ */
+static bool is_same_port_identity(const PortIdentity *a, const PortIdentity *b)
+{
+    return (memcmp(a->clockIdentity, b->clockIdentity, 8) == 0 && a->portNumber == b->portNumber);
+}
+
+/**
+ * @brief Add or update a foreign master record in our list.
+ * @param clock A pointer to the PTP clock data structure.
+ * @param header The header of the received Announce message.
+ * @param announce The body of the received Announce message.
+ */
+void bmc_add_foreign_master(ptp_clock_t *clock, const PtpHeader *header, const AnnounceMessage *announce)
+{
+    int i;
+    bool found = false;
+
+    // Check if we've already seen this master
+    for (i = 0; i < PTPD_DEFAULT_MAX_FOREIGN_RECORDS; ++i) {
+        if (clock->foreign[i].port_identity.portNumber != 0 &&
+            is_same_port_identity(&clock->foreign[i].port_identity, &header->sourcePortIdentity)) {
+            
+            // Master found, update its information
+            clock->foreign[i].header = *header;
+            clock->foreign[i].announce_message = *announce;
+            found = true;
+            break;
+        }
+    }
+
+    // If not found, add as a new foreign master
+    if (!found) {
+        for (i = 0; i < PTPD_DEFAULT_MAX_FOREIGN_RECORDS; ++i) {
+            if (clock->foreign[i].port_identity.portNumber == 0) {
+                // Found an empty slot
+                clock->foreign[i].port_identity = header->sourcePortIdentity;
+                clock->foreign[i].header = *header;
+                clock->foreign[i].announce_message = *announce;
+                break;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Update the clock's internal datasets when it becomes the master.
+ * This corresponds to states M1/M2 in the standard.
+ * @param clock A pointer to our own PTP clock data structure.
+ */
+static void update_local_as_master(ptp_clock_t *clock)
+{
+    xil_printf("PTPd: State change to MASTER\r\n");
+
+    // Parent DS becomes our own identity
+    clock->parent_ds.parent_port_identity = clock->port_ds.port_identity;
+    memcpy(clock->parent_ds.grandmaster_identity, clock->default_ds.clock_identity, 8);
+    clock->parent_ds.grandmaster_clock_quality = clock->default_ds.clock_quality;
+    clock->parent_ds.grandmaster_priority1 = clock->default_ds.priority1;
+    clock->parent_ds.grandmaster_priority2 = clock->default_ds.priority2;
+
+    // Time Properties DS reflects we are the source
+    clock->time_properties_ds.current_utc_offset = 0; // Or a configured value
+    clock->time_properties_ds.current_utc_offset_valid = TRUE;
+    clock->time_properties_ds.time_traceable = TRUE;
+    clock->time_properties_ds.time_source = 0xA0; // Internal Oscillator
+}
+
+/**
+ * @brief Update the clock's internal datasets when it becomes a slave.
+ * This corresponds to state S1 in the standard.
+ * @param clock A pointer to our own PTP clock data structure.
+ * @param header The header from the new master's Announce message.
+ * @param announce The body from the new master's Announce message.
+ */
+static void update_parent_data_set(ptp_clock_t *clock, const PtpHeader *header, const AnnounceMessage *announce)
+{
+    xil_printf("PTPd: State change to SLAVE. New master: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\r\n",
+        announce->grandmasterIdentity[0], announce->grandmasterIdentity[1], announce->grandmasterIdentity[2],
+        announce->grandmasterIdentity[3], announce->grandmasterIdentity[4], announce->grandmasterIdentity[5],
+        announce->grandmasterIdentity[6], announce->grandmasterIdentity[7]);
+
+    // Parent DS is now the new master's identity
+    clock->parent_ds.parent_port_identity = header->sourcePortIdentity;
+    memcpy(clock->parent_ds.grandmaster_identity, announce->grandmasterIdentity, 8);
+    clock->parent_ds.grandmaster_clock_quality = announce->grandmasterClockQuality;
+    clock->parent_ds.grandmaster_priority1 = announce->grandmasterPriority1;
+    clock->parent_ds.grandmaster_priority2 = announce->grandmasterPriority2;
+
+    // Time Properties DS is inherited from the master
+    clock->time_properties_ds.current_utc_offset = announce->currentUtcOffset;
+    // A full implementation would get flags from header->flags field
+    clock->time_properties_ds.current_utc_offset_valid = TRUE;
+    clock->time_properties_ds.time_traceable = TRUE;
+    clock->time_properties_ds.time_source = announce->timeSource;
+}
+
+
+/**
+ * @brief Compare two Announce messages to determine which is from a better clock.
+ * @return > 0 if A is better, < 0 if B is better, 0 if they are equal.
+ */
+static int8_t compare_datasets(const PtpHeader *hA, const AnnounceMessage *aA, const PtpHeader *hB, const AnnounceMessage *aB, ptp_clock_t *clock)
+{
+    // Part 1: Compare grandmaster properties
+    if (aA->grandmasterPriority1 < aB->grandmasterPriority1) return 1;
+    if (aA->grandmasterPriority1 > aB->grandmasterPriority1) return -1;
+
+    if (aA->grandmasterClockQuality.clock_class < aB->grandmasterClockQuality.clock_class) return 1;
+    if (aA->grandmasterClockQuality.clock_class > aB->grandmasterClockQuality.clock_class) return -1;
+
+    if (aA->grandmasterClockQuality.clock_accuracy < aB->grandmasterClockQuality.clock_accuracy) return 1;
+    if (aA->grandmasterClockQuality.clock_accuracy > aB->grandmasterClockQuality.clock_accuracy) return -1;
+
+    if (aA->grandmasterClockQuality.offset_scaled_log_variance < aB->grandmasterClockQuality.offset_scaled_log_variance) return 1;
+    if (aA->grandmasterClockQuality.offset_scaled_log_variance > aB->grandmasterClockQuality.offset_scaled_log_variance) return -1;
+
+    if (aA->grandmasterPriority2 < aB->grandmasterPriority2) return 1;
+    if (aA->grandmasterPriority2 > aB->grandmasterPriority2) return -1;
+
+    int identity_cmp = memcmp(aA->grandmasterIdentity, aB->grandmasterIdentity, 8);
+    if (identity_cmp < 0) return 1;
+    if (identity_cmp > 0) return -1;
+
+    // Part 2: Tie-breaking based on topology
+    if (aA->stepsRemoved > aB->stepsRemoved + 1) return -1; // B is better
+    if (aB->stepsRemoved > aA->stepsRemoved + 1) return 1;  // A is better
+
+    if (aA->stepsRemoved > aB->stepsRemoved) {
+        return (memcmp(hA->sourcePortIdentity.clockIdentity, clock->port_identity.clockIdentity, 8) == 0) ? 1 : -1;
+    }
+    if (aB->stepsRemoved > aA->stepsRemoved) {
+        return (memcmp(hB->sourcePortIdentity.clockIdentity, clock->port_identity.clockIdentity, 8) == 0) ? -1 : 1;
+    }
+
+    // Final tie-breaker: compare sender port identities
+    int final_cmp = memcmp(hA->sourcePortIdentity.clockIdentity, hB->sourcePortIdentity.clockIdentity, 8);
+    if (final_cmp < 0) return 1;
+    if (final_cmp > 0) return -1;
+    
+    return 0; // Identical
+}
+
+
+/**
+ * @brief Based on the best master seen, decide what state our clock should be in.
+ * @param best_header The header from the best clock's Announce message.
+ * @param best_announce The body from the best clock's Announce message.
+ * @param clock A pointer to our own PTP clock data structure.
+ * @return The new PTP state (PTP_MASTER, PTP_SLAVE, or PTP_PASSIVE).
+ */
+static uint8_t state_decision(const PtpHeader *best_header, const AnnounceMessage *best_announce, ptp_clock_t *clock)
+{
+    // Create an Announce message and header representing our own clock's quality
+    AnnounceMessage local_announce;
+    PtpHeader local_header;
+    memset(&local_announce, 0, sizeof(AnnounceMessage));
+    memset(&local_header, 0, sizeof(PtpHeader));
+
+    local_announce.grandmasterPriority1 = ptp_opts.priority1;
+    local_announce.grandmasterClockQuality = ptp_opts.clock_quality;
+    local_announce.grandmasterPriority2 = ptp_opts.priority2;
+    memcpy(local_announce.grandmasterIdentity, clock->default_ds.clock_identity, 8);
+    local_announce.stepsRemoved = 0;
+    local_header.sourcePortIdentity = clock->port_ds.port_identity;
+
+    if (compare_datasets(&local_header, &local_announce, best_header, best_announce, clock) > 0) {
+        update_local_as_master(clock);
+        return PTP_MASTER;
+    } else {
+        update_parent_data_set(clock, best_header, best_announce);
+        return PTP_SLAVE;
+    }
+}
+
+
+/**
+ * @brief The main Best Master Clock algorithm function.
+ * @param clock A pointer to the PTP clock data structure.
+ * @return The recommended new PTP state.
+ */
+uint8_t bmc(ptp_clock_t *clock)
+{
+    int i, best_index = -1;
+
+    // Find the first valid foreign master to start the comparison
+    for (i = 0; i < PTPD_DEFAULT_MAX_FOREIGN_RECORDS; ++i) {
+        if (clock->foreign[i].port_identity.portNumber != 0) {
+            best_index = i;
+            break;
+        }
+    }
+
+    if (best_index == -1) {
+        // No foreign masters have been seen yet.
+        if (!ptp_opts.slave_only) {
+            update_local_as_master(clock);
+            return PTP_MASTER;
+        }
+        return PTP_LISTENING;
+    }
+
+    // Find the best clock among all foreign masters
+    for (i = best_index + 1; i < PTPD_DEFAULT_MAX_FOREIGN_RECORDS; ++i) {
+        if (clock->foreign[i].port_identity.portNumber == 0) {
+            continue; // Skip empty slots
+        }
+        if (compare_datasets(&clock->foreign[i].header, &clock->foreign[i].announce_message,
+                             &clock->foreign[best_index].header, &clock->foreign[best_index].announce_message, clock) > 0) {
+            best_index = i;
+        }
+    }
+
+    // Now make a state decision based on the best master found
+    return state_decision(&clock->foreign[best_index].header, &clock->foreign[best_index].announce_message, clock);
+}

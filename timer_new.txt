@@ -1,0 +1,110 @@
+/**
+ * @file timer.c
+ * @brief Software timer management for the PTP daemon.
+ *
+ * This file implements a simple set of non-blocking software timers that are
+ * driven by a periodic hardware tick.
+ */
+
+#include "../ptpd.h"
+
+// --- Global PTP Data Structures ---
+extern ptp_clock_t ptp_clock;
+
+/**
+ * @brief Initialize all software timers to be inactive.
+ * @param clock A pointer to the PTP clock data structure.
+ */
+void init_timer_lists(ptp_clock_t *clock)
+{
+    clock->sync_interval_timer = -1;
+    clock->announce_interval_timer = -1;
+    // Initialize other timers here...
+}
+
+/**
+ * @brief Start a software timer.
+ * @param timer_id A pointer to the integer representing the timer.
+ * @param interval_ms The duration of the timer in milliseconds.
+ */
+void timer_start(int32_t *timer_id, uint32_t interval_ms)
+{
+    // The timer value is the number of ticks it will run for.
+    // PTP_TICK_RATE_HZ is defined in main.c (e.g., 10 Hz).
+    *timer_id = (interval_ms * PTP_TICK_RATE_HZ) / 1000;
+    if (*timer_id == 0) {
+        *timer_id = 1; // Ensure timer runs for at least one tick
+    }
+}
+
+/**
+ * @brief Stop a software timer.
+ * @param timer_id A pointer to the integer representing the timer.
+ */
+void timer_stop(int32_t *timer_id)
+{
+    *timer_id = -1; // -1 indicates the timer is inactive
+}
+
+/**
+ * @brief Check if a software timer has expired.
+ * @param timer_id A pointer to the integer representing the timer.
+ * @return TRUE if the timer has expired, FALSE otherwise.
+ */
+bool timer_expired(int32_t *timer_id)
+{
+    if (*timer_id > 0) {
+        return false; // Still running
+    }
+    if (*timer_id == 0) {
+        *timer_id = -1; // Expired, so mark as inactive for the next round
+        return true;
+    }
+    return false; // Already inactive
+}
+
+
+/**
+ * @brief Main timer tick function, called periodically by the hardware timer.
+ *
+ * This function decrements all active software timers.
+ *
+ * @param clock A pointer to the PTP clock data structure.
+ */
+void timer_tick(ptp_clock_t *clock)
+{
+    // Decrement all active timers
+    if (clock->sync_interval_timer > 0) {
+        clock->sync_interval_timer--;
+    }
+    if (clock->announce_interval_timer > 0) {
+        clock->announce_interval_timer--;
+    }
+    // Decrement other timers here...
+}
+```
+
+ Error with igmp_joingroup
+This error usually happens for one of two reasons:
+
+Cause A: IGMP is disabled in lwIP. The Internet Group Management Protocol (IGMP), which is required for multicast, might be turned off in your lwIP configuration.
+
+Solution: Open your lwipopts.h file and make sure you have the line:
+
+C
+
+#define LWIP_IGMP 1
+Cause B: Incorrect function arguments. Different versions of lwIP have slightly different ways of joining multicast groups. The most robust way is to pass the entire network interface structure, not just its IP address.
+
+Solution: In your net.c file, find the ptpd_net_init function and change the igmp_joingroup calls to use igmp_joingroup_netif:
+
+C
+
+// In ptpd_net_init() in net.c
+
+// OLD
+// err = igmp_joingroup(&default_netif->ip_addr, &ptp_primary_multicast);
+
+// NEW and more robust
+err = igmp_joingroup_netif(default_netif, &ptp_primary_multicast);
+Do the same for the ptp_peer_multicast call. This is the preferred method in modern lwIP versions.
