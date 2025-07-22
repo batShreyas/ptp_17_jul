@@ -1,0 +1,203 @@
+#include <stdio.h>
+#include "xparameters.h"
+#include "netif/xadapter.h"
+#include "platform.h"
+#include "platform_config.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+
+// lwIP Includes
+#include "lwip/init.h"
+#include "lwip/netif.h"
+#include "lwip/inet.h"
+
+#if LWIP_DHCP
+#include "lwip/dhcp.h"
+extern volatile int dhcp_timoutcntr;
+#endif
+
+// PTP Includes
+#include "ptp/ptpd.h"
+
+// Hardware Driver Includes for Timer and Interrupts
+#include "xintc.h"      // AXI Interrupt Controller Header
+#include "xtmrctr.h"    // AXI Timer Header
+
+// --- Constant Definitions ---
+#define DEFAULT_IP_ADDRESS  "192.168.1.10"
+#define DEFAULT_IP_MASK     "255.255.255.0"
+#define DEFAULT_GW_ADDRESS  "192.168.1.1"
+
+// ** IMPORTANT: Update these IDs to match your Vivado Block Design **
+#define INTC_DEVICE_ID      XPAR_INTC_0_DEVICE_ID
+#define TMRCTR_DEVICE_ID    XPAR_TMRCTR_0_DEVICE_ID
+#define TIMER_IRPT_INTR     XPAR_INTC_0_TMRCTR_0_VEC_ID
+
+// PTP periodic tick rate (10 Hz = 100ms)
+#define PTP_TICK_RATE_HZ    10
+#define TIMER_RESET_VALUE   (XPAR_AXI_TIMER_0_CLOCK_FREQ_HZ / PTP_TICK_RATE_HZ)
+
+// --- Global Variables ---
+struct netif server_netif;
+static XIntc interrupt_controller;
+static XTmrCtr timer_controller;
+
+// Flag set by the timer ISR to trigger PTP processing
+volatile int ptp_timer_flag = 0;
+
+// PTP Globals (defined here, used by other modules via 'extern')
+ptp_clock_t ptp_clock;
+ptpd_opts ptp_opts;
+
+// --- Function Prototypes ---
+static int setup_interrupt_system();
+static void Timer_ISR_Handler(void *CallBackRef, u8 TmrCtrNumber);
+static void ptpd_opts_init();
+static void print_ip_settings(ip_addr_t *ip, ip_addr_t *mask, ip_addr_t *gw);
+static void assign_default_ip(ip_addr_t *ip, ip_addr_t *mask, ip_addr_t *gw);
+
+
+// --- Main Application ---
+int main()
+{
+    struct netif *netif = &server_netif;
+
+    unsigned char mac_ethernet_address[] = {
+        0x00, 0x0a, 0x35, 0x00, 0x01, 0x02 };
+
+    init_platform();
+
+    xil_printf("\r\n----- PTP + lwIP Server (Bare-Metal) -----\r\n");
+
+    // 1. Initialize lwIP stack
+    lwip_init();
+
+    // 2. Add and configure the network interface
+    if (!xemac_add(netif, NULL, NULL, NULL, mac_ethernet_address,
+                   PLATFORM_EMAC_BASEADDR)) {
+        xil_printf("Error adding network interface\r\n");
+        return -1;
+    }
+    netif_set_default(netif);
+    netif_set_up(netif);
+
+    // 3. Set up hardware timers and interrupts
+    platform_enable_interrupts();
+    setup_interrupt_system(); // For the periodic PTP tick
+    ptpd_hw_timer_init();     // For the 64-bit high-res timestamp
+
+    // 4. Configure IP address (DHCP or Static)
+#if LWIP_DHCP
+    dhcp_start(netif);
+    dhcp_timoutcntr = 240;
+    while ((netif->ip_addr.addr == 0) && (dhcp_timoutcntr > 0)) {
+        xemacif_input(netif);
+    }
+    if (netif->ip_addr.addr == 0) {
+        xil_printf("DHCP timeout! Assigning static IP.\r\n");
+        assign_default_ip(&(netif->ip_addr), &(netif->netmask), &(netif->gw));
+    }
+#else
+    assign_default_ip(&(netif->ip_addr), &(netif->netmask), &(netif->gw));
+#endif
+    print_ip_settings(&(netif->ip_addr), &(netif->netmask), &(netif->gw));
+
+    // 5. Initialize the PTPd stack
+    ptpd_opts_init();
+    ptpd_net_init(&ptp_clock);
+    to_state(&ptp_clock, PTP_INITIALIZING); // Start the PTP state machine
+
+    xil_printf("PTP initialized. Starting main loop...\r\n");
+
+    // 6. --- Main Super-Loop ---
+    while (1) {
+        // A. Poll the network interface for incoming packets
+        xemacif_input(netif);
+
+        // B. Check if the periodic timer has fired to run the PTP handler
+        if (ptp_timer_flag) {
+            ptp_timer_flag = 0; // Reset the flag
+            ptpd_periodic_handler(); // This calls protocol_tick()
+        }
+    }
+
+    cleanup_platform();
+    return 0;
+}
+
+
+// --- Initialization and Helper Functions ---
+
+/**
+ * @brief Initializes the PTPd runtime options.
+ */
+static void ptpd_opts_init()
+{
+    xil_printf("Initializing ptpd options...\r\n");
+    memset(&ptp_opts, 0, sizeof(ptpd_opts));
+    ptp_opts.slave_only = TRUE; // Configure this device as a slave-only clock
+    ptp_opts.sync_interval = 1;
+    ptp_opts.announce_interval = 1;
+    ptp_opts.clock_quality.clock_class = 255; // Not capable of being a master
+    ptp_opts.clock_quality.clock_accuracy = 0xFE;
+    ptp_opts.clock_quality.offset_scaled_log_variance = 0xFFFF;
+    ptp_opts.priority1 = 255;
+    ptp_opts.priority2 = 255;
+}
+
+/**
+ * @brief The ISR for the periodic timer. It just sets a flag for the main loop.
+ */
+void Timer_ISR_Handler(void *CallBackRef, u8 TmrCtrNumber)
+{
+    ptp_timer_flag = 1;
+}
+
+/**
+ * @brief Configures the AXI Timer and Interrupt Controller for the periodic tick.
+ */
+static int setup_interrupt_system()
+{
+    int status;
+    status = XIntc_Initialize(&interrupt_controller, INTC_DEVICE_ID);
+    if (status != XST_SUCCESS) return XST_FAILURE;
+
+    status = XTmrCtr_Initialize(&timer_controller, TMRCTR_DEVICE_ID);
+    if (status != XST_SUCCESS) return XST_FAILURE;
+
+    status = XIntc_Connect(&interrupt_controller, TIMER_IRPT_INTR,
+                           (XInterruptHandler)XTmrCtr_InterruptHandler,
+                           &timer_controller);
+    if (status != XST_SUCCESS) return XST_FAILURE;
+
+    status = XIntc_Start(&interrupt_controller, XIN_REAL_MODE);
+    if (status != XST_SUCCESS) return XST_FAILURE;
+
+    XIntc_Enable(&interrupt_controller, TIMER_IRPT_INTR);
+    XTmrCtr_SetHandler(&timer_controller, Timer_ISR_Handler, NULL);
+    XTmrCtr_SetOptions(&timer_controller, 0, XTC_INT_MODE_OPTION | XTC_AUTO_RELOAD_OPTION);
+    XTmrCtr_SetResetValue(&timer_controller, 0, TIMER_RESET_VALUE);
+    XTmrCtr_Start(&timer_controller, 0);
+
+    return XST_SUCCESS;
+}
+
+static void print_ip(char *msg, ip_addr_t *ip)
+{
+    xil_printf("%s: %d.%d.%d.%d\r\n", msg,
+               ip4_addr1(ip), ip4_addr2(ip), ip4_addr3(ip), ip4_addr4(ip));
+}
+
+static void print_ip_settings(ip_addr_t *ip, ip_addr_t *mask, ip_addr_t *gw)
+{
+    print_ip("Board IP", ip);
+    print_ip("Netmask", mask);
+    print_ip("Gateway", gw);
+}
+
+static void assign_default_ip(ip_addr_t *ip, ip_addr_t *mask, ip_addr_t *gw)
+{
+    inet_aton(DEFAULT_IP_ADDRESS, ip);
+    inet_aton(DEFAULT_IP_MASK, mask);
+    inet_aton(DEFAULT_GW_ADDRESS, gw);
+}

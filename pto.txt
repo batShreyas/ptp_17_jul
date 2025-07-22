@@ -1,0 +1,251 @@
+#include "ptpd.h"
+#include <stdlib.h> // For abs()
+
+// --- Global PTP Data Structures ---
+// These are defined in main.c and used throughout the PTP stack.
+extern ptp_clock_t ptp_clock;
+extern ptpd_opts ptp_opts;
+
+// --- Function Prototypes for Static Functions ---
+static void issue_announce(ptp_clock_t *clock);
+static void issue_sync(ptp_clock_t *clock);
+static void issue_follow_up(ptp_clock_t *clock, const TimeInternal *sync_ts);
+static void issue_delay_req(ptp_clock_t *clock);
+static void issue_delay_resp(ptp_clock_t *clock, const PtpHeader *req_header, const TimeInternal *rx_ts);
+
+
+/**
+ * @brief Transition the PTP port to a new state, performing entry/exit actions.
+ * @param clock A pointer to the PTP clock data structure.
+ * @param state The new state to transition to.
+ */
+void to_state(ptp_clock_t *clock, ptp_port_state_t state)
+{
+    if (clock->port_ds.port_state == state) {
+        return;
+    }
+
+    xil_printf("PTPd: State change from %d to %d\r\n", clock->port_ds.port_state, state);
+
+    // --- Actions on LEAVING a state ---
+    switch (clock->port_ds.port_state) {
+        case PTP_MASTER:
+            timer_stop(&clock->sync_interval_timer);
+            timer_stop(&clock->announce_interval_timer);
+            break;
+        case PTP_SLAVE:
+        case PTP_UNCALIBRATED:
+            timer_stop(&clock->delay_req_interval_timer);
+            break;
+        default:
+            break;
+    }
+
+    clock->port_ds.port_state = state;
+
+    // --- Actions on ENTERING a new state ---
+    switch (state) {
+        case PTP_MASTER:
+            timer_start(&clock->announce_interval_timer, 2000); // 2 second interval
+            timer_start(&clock->sync_interval_timer, 1000);     // 1 second interval
+            update_local_as_master(clock);
+            break;
+
+        case PTP_SLAVE:
+            // The delay_req timer is started when transitioning to UNCALIBRATED
+            break;
+
+        case PTP_UNCALIBRATED:
+            timer_start(&clock->delay_req_interval_timer, 1000); // 1 second interval
+            servo_init_clock(clock);
+            break;
+
+        case PTP_LISTENING:
+            timer_stop(&clock->sync_interval_timer);
+            timer_stop(&clock->delay_req_interval_timer);
+            timer_start(&clock->announce_receipt_timer, 6000); // Timeout if no announce in 6s
+            break;
+        
+        case PTP_INITIALIZING:
+            clock->recommended_state = PTP_INITIALIZING;
+            init_data(clock, &ptp_opts);
+            init_timer_lists(clock);
+            servo_init_clock(clock);
+            to_state(clock, PTP_LISTENING); // Immediately transition to listening
+            break;
+
+        case PTP_FAULTY:
+            xil_printf("PTPd: Entered FAULTY state.\r\n");
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+/**
+ * @brief The main periodic tick for the protocol state machine.
+ *
+ * This function is called from ptpd_periodic_handler() in ptpd.c. It checks
+ * for expired software timers and triggers the corresponding actions.
+ *
+ * @param clock A pointer to the PTP clock data structure.
+ */
+void protocol_tick(ptp_clock_t *clock)
+{
+    // Check for a state change recommendation from the BMC
+    if (clock->recommended_state != PTP_INITIALIZING && clock->port_ds.port_state != clock->recommended_state) {
+        to_state(clock, clock->recommended_state);
+    }
+
+    // Handle timer expirations based on the current state
+    switch (clock->port_ds.port_state) {
+        case PTP_MASTER:
+            if (timer_expired(&clock->announce_interval_timer)) {
+                issue_announce(clock);
+            }
+            if (timer_expired(&clock->sync_interval_timer)) {
+                issue_sync(clock);
+            }
+            break;
+
+        case PTP_SLAVE:
+        case PTP_UNCALIBRATED:
+            if (timer_expired(&clock->delay_req_interval_timer)) {
+                issue_delay_req(clock);
+            }
+            // Fall through to check announce timeout
+        case PTP_LISTENING:
+            if (timer_expired(&clock->announce_receipt_timer)) {
+                xil_printf("PTPd: Announce receipt timeout.\r\n");
+                // No master seen, recommend becoming master (if not slave-only)
+                clock->recommended_state = bmc(clock);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+// --- Message Handler Functions ---
+// These are called by handle_msg() in msg.c when a PTP packet is received.
+
+void handle_announce(const PtpHeader *header, const AnnounceMessage *announce)
+{
+    // Always run BMC on receiving an announce message
+    bmc_add_foreign_master(&ptp_clock, header, announce);
+    ptp_clock.recommended_state = bmc(&ptp_clock);
+    // Restart announce receipt timer
+    timer_start(&ptp_clock.announce_receipt_timer, 6000);
+}
+
+void handle_sync(const PtpHeader *header, const TimeInternal *originTimestamp)
+{
+    if (ptp_clock.port_ds.port_state != PTP_SLAVE && ptp_clock.port_ds.port_state != PTP_UNCALIBRATED) {
+        return;
+    }
+
+    // Check if message is from our current parent
+    if (memcmp(header->sourcePortIdentity.clockIdentity, ptp_clock.parent_ds.parent_port_identity.clockIdentity, 8) != 0) {
+        return;
+    }
+
+    getTime(&ptp_clock.sync_receive_time); // T2: Capture hardware time of arrival
+
+    if (!(header->flags & 0x0200)) { // 1-step clock
+        servo_update_offset(&ptp_clock, &ptp_clock.sync_receive_time, originTimestamp);
+        servo_update_clock(&ptp_clock);
+    } else { // 2-step clock
+        ptp_clock.waiting_for_followup = TRUE;
+        ptp_clock.sync_header = *header;
+    }
+}
+
+void handle_follow_up(const PtpHeader *header, const TimeInternal *preciseOriginTimestamp)
+{
+    if (ptp_clock.waiting_for_followup && header->sequenceId == ptp_clock.sync_header.sequenceId) {
+        ptp_clock.waiting_for_followup = FALSE;
+        servo_update_offset(&ptp_clock, &ptp_clock.sync_receive_time, preciseOriginTimestamp);
+        servo_update_clock(&ptp_clock);
+    }
+}
+
+void handle_delay_req(const PtpHeader *header, const TimeInternal *rx_ts)
+{
+    if (ptp_clock.port_ds.port_state == PTP_MASTER) {
+        issue_delay_resp(&ptp_clock, header, rx_ts);
+    }
+}
+
+void handle_delay_resp(const PtpHeader *header, const TimeInternal *receiveTimestamp, const PortIdentity *requestingPortIdentity)
+{
+    if ((ptp_clock.port_ds.port_state == PTP_SLAVE || ptp_clock.port_ds.port_state == PTP_UNCALIBRATED) &&
+        header->sequenceId == ptp_clock.sent_delay_req_sequence_id) {
+        
+        servo_update_delay(&ptp_clock, &ptp_clock.delay_req_send_time, receiveTimestamp);
+        servo_update_clock(&ptp_clock); // Recalculate offset with new delay
+        
+        // Transition from UNCALIBRATED to SLAVE if offset is small enough
+        if (ptp_clock.port_ds.port_state == PTP_UNCALIBRATED && abs(ptp_clock.offset_from_master.nanoseconds) < 1000) {
+            to_state(&ptp_clock, PTP_SLAVE);
+        }
+    }
+}
+
+
+// --- Message Issuing Functions ---
+
+static void issue_announce(ptp_clock_t *clock)
+{
+    uint8_t buf[64];
+    msg_pack_announce(buf, clock);
+    net_send_general(buf, 64);
+    timer_start(&clock->announce_interval_timer, 2000);
+}
+
+static void issue_sync(ptp_clock_t *clock)
+{
+    uint8_t buf[44];
+    TimeInternal sync_ts;
+
+    getTime(&sync_ts);
+    msg_pack_sync(buf, clock, &sync_ts);
+    net_send_event(buf, 44);
+
+    if (clock->default_ds.two_step_flag) {
+        issue_follow_up(clock, &sync_ts);
+    }
+
+    clock->sent_sync_sequence_id++;
+    timer_start(&clock->sync_interval_timer, 1000);
+}
+
+static void issue_follow_up(ptp_clock_t *clock, const TimeInternal *sync_ts)
+{
+    uint8_t buf[44];
+    // Sequence ID must match the Sync message
+    clock->sent_sync_sequence_id--;
+    msg_pack_follow_up(buf, clock, sync_ts);
+    net_send_general(buf, 44);
+    clock->sent_sync_sequence_id++;
+}
+
+static void issue_delay_req(ptp_clock_t *clock)
+{
+    uint8_t buf[44];
+    getTime(&clock->delay_req_send_time);
+    msg_pack_delay_req(buf, clock, &clock->delay_req_send_time);
+    net_send_event(buf, 44);
+    clock->sent_delay_req_sequence_id++;
+    timer_start(&clock->delay_req_interval_timer, 1000);
+}
+
+static void issue_delay_resp(ptp_clock_t *clock, const PtpHeader *req_header, const TimeInternal *rx_ts)
+{
+    uint8_t buf[54];
+    msg_pack_delay_resp(buf, clock, req_header, rx_ts);
+    net_send_general(buf, 54);
+}
