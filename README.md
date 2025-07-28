@@ -178,3 +178,22 @@ If you do not see this output, the program is not running, and it will never be 
 
 If you go through these steps, you will almost certainly find the problem. My guess is that it's either the firewall or an IP address mismatch.
 
+#include "xil_printf.h"
+#include "platform.h"
+
+int main()
+{
+    // Initialize the platform, which sets up the UART.
+    init_platform();
+
+    // Print a simple, single message.
+    xil_printf("Bare-metal application is running!\r\n");
+
+    // Loop forever.
+    while(1) {
+        // Do nothing.
+    }
+
+    cleanup_platform();
+    return 0;
+}
