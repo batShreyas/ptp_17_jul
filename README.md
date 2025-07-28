@@ -1,4 +1,4 @@
-Excellent! Congratulations on getting the project built successfully. That's a huge milestone.
+toExcellent! Congratulations on getting the project built successfully. That's a huge milestone.
 
 Now for the exciting part: running it on the hardware. Here are the step-by-step instructions to get your KCU105 board synchronized.
 
@@ -118,4 +118,63 @@ DOS
 ptpd.exe -M -b 192.168.1.100
 A status window for PTPd will appear, and it will start sending PTP master messages. Leave this window open.
 
-Your Windows PC is now acting as the PTP grandmaster clock. You can now proceed with Step 3 (Program and Run on the KCU105) and Step 4 (Observe the Output) exactly as described before.
+Your Windows PC is now acting as the PTP grandmaster clock. You can now proceed with Step 3 (Program and Run on the KCU105) and Step 4 (Observe the Output) exactly as described before
+
+That's a very common and important issue to solve! A "Request timed out" error means your PC is sending the ping, but the KCU105 board is not sending a reply back.
+
+Let's troubleshoot this step-by-step, starting with the most common causes.
+
+1. Check Physical Link Lights (Most Important First Step)
+Look at the physical SFP port on your KCU105 and the port on your network switch that it's connected to.
+
+Do you see a solid green light on both ports? This is called a "link light." If there is no light, it means there is no physical electrical connection.
+
+Action: Make sure the SFP module is pushed firmly into the KCU105. Make sure the Ethernet cable is securely plugged into both the SFP module and the switch. Try a different port on the switch.
+
+2. Check the Windows Firewall
+The Windows Firewall is the most common reason pings fail. It often blocks the incoming reply from the board.
+
+Action: Let's temporarily disable it to see if it's the problem.
+
+Open the Windows Start Menu and type "Windows Defender Firewall".
+
+Click on "Turn Windows Defender Firewall on or off" on the left side.
+
+For the "Private network settings", select "Turn off Windows Defender Firewall".
+
+Click OK.
+
+Try to ping the board again (ping 192.168.1.10). If it works now, the firewall was the issue. Remember to turn it back on afterward!
+
+3. Verify Your PC's IP Address
+Your PC must be on the same network subnet as the board.
+
+Action:
+
+Open the Command Prompt (cmd.exe).
+
+Type ipconfig and press Enter.
+
+Look for your "Ethernet adapter". Its IPv4 Address must start with 192.168.1.x (for example, 192.168.1.100) and the Subnet Mask must be 255.255.255.0.
+
+If it's not, you need to set a static IP address on your PC's Ethernet adapter.
+
+4. Check the Board's Serial Output
+Is the software actually running on the board? The only way to know is to check the serial terminal.
+
+Action:
+
+Make sure your serial terminal (PuTTY, Tera Term, etc.) is connected and open.
+
+Reset the KCU105 board.
+
+You must see the startup messages, especially the IP address printout:
+
+----- PTP + lwIP Server (Bare-Metal) -----
+...
+Board IP: 192.168.1.10
+...
+If you do not see this output, the program is not running, and it will never be able to reply to a ping.
+
+If you go through these steps, you will almost certainly find the problem. My guess is that it's either the firewall or an IP address mismatch.
+
